@@ -1,6 +1,7 @@
 # coding: utf-8
 # Copyright (c) Pymatgen Development Team.
 # Distributed under the terms of the MIT License.
+from typing import Union, Tuple, Optional
 
 import numpy as np
 import warnings
@@ -426,15 +427,19 @@ class FermiDos(Dos, MSONable):
         structure: A structure. If not provided, the structure
             of the dos object will be used. If the dos does not have an
             associated structure object, an error will be thrown.
+        dos_weight: The weighting for the dos. Defaults to 2 for non-spin
+            polarized calculations and 1 for spin-polarized calculations.
         nelecs: The number of electrons included in the energy range of
-            dos. It is used for normalizing the densities. Default is the total
-            number of electrons in the structure.
+            dos used for normalizing the densities. If None, the densities
+            will not be normalized.
         bandgap: If set, the energy values are scissored so that the electronic
             band gap matches this value.
     """
 
     def __init__(self, dos: Dos, structure: Structure = None,
-                 nelecs: float = None, bandgap: float = None):
+                 dos_weight: Optional[float] = None,
+                 nelecs: Optional[float] = None,
+                 bandgap: Optional[float] = None):
         super().__init__(dos.efermi, energies=dos.energies,
                          densities={k: np.array(d) for k, d in
                                     dos.densities.items()})
@@ -454,17 +459,23 @@ class FermiDos(Dos, MSONable):
         self.de = np.hstack(
             (self.energies[1:], self.energies[-1])) - self.energies
 
-        # normalize total density of states based on integral at 0K
-        tdos = np.array(self.get_densities())
-        self.tdos = tdos * self.nelecs / (tdos * self.de)[self.energies <=
-                                                          self.efermi].sum()
+        if not dos_weight:
+            dos_weight = 2 if len(self.densities) == 1 else 1
+        self.dos_weight = dos_weight
 
-        ecbm, evbm = self.get_cbm_vbm()
-        self.idx_vbm = np.argmin(abs(self.energies - evbm))
-        self.idx_cbm = np.argmin(abs(self.energies - ecbm))
-        self.A_to_cm = 1e-8
+        self.tdos = np.array(self.get_densities()) * self.dos_weight
+
+        nelect_integ = (self.tdos * self.de)[self.energies <= self.efermi].sum()
+        if nelecs:
+            # normalize total density of states based on integral at 0K
+            self.tdos = self.tdos * self.nelecs / nelect_integ
+        else:
+            self.nelecs = nelect_integ
+
+        self.idx_fermi = np.argmin(abs(self.energies - self.efermi))
 
         if bandgap:
+            ecbm, evbm = self.get_cbm_vbm()
             if evbm < self.efermi < ecbm:
                 eref = self.efermi
             else:
@@ -472,14 +483,12 @@ class FermiDos(Dos, MSONable):
 
             idx_fermi = np.argmin(abs(self.energies - eref))
 
-            if idx_fermi == self.idx_vbm:
-                # Fermi level and vbm should be different indices
-                idx_fermi += 1
-
             self.energies[:idx_fermi] -= (bandgap - (ecbm - evbm)) / 2.0
             self.energies[idx_fermi:] += (bandgap - (ecbm - evbm)) / 2.0
 
-    def get_doping(self, fermi_level: float, temperature: float) -> float:
+    def get_doping(self, fermi_level: float, temperature: float,
+                   return_electron_hole_conc: bool = False
+                   ) -> Union[float, Tuple[float, float, float]]:
         """
         Calculate the doping (majority carrier concentration) at a given
         fermi level  and temperature. A simple Left Riemann sum is used for
@@ -489,22 +498,35 @@ class FermiDos(Dos, MSONable):
         Args:
             fermi_level: The fermi_level level in eV.
             temperature: The temperature in Kelvin.
+            return_electron_hole_conc: Whether to also return the separate
+                electron and hole concentrations at the doping level.
 
         Returns:
-            The doping concentration in units of 1/cm^3. Negative values
-            indicate that the majority carriers are electrons (n-type doping)
-            whereas positivie values indicates the majority carriers are holes
-            (p-type doping).
+            If return_electron_hole_conc is False: the doping concentration in
+            units of 1/cm^3. Negative values indicate that the majority carriers
+            are electrons (n-type doping) whereas positive values indicates the
+            majority carriers are holes (p-type doping).
+
+            If return_electron_hole_conc is True: the doping concentration,
+            electron concentration and hole concentration as a tuple.
         """
         cb_integral = np.sum(
-            self.tdos[self.idx_cbm:]
-            * f0(self.energies[self.idx_cbm:], fermi_level, temperature)
-            * self.de[self.idx_cbm:], axis=0)
+            self.tdos[self.idx_fermi:]
+            * f0(self.energies[self.idx_fermi:], fermi_level, temperature)
+            * self.de[self.idx_fermi:], axis=0)
         vb_integral = np.sum(
-            self.tdos[:self.idx_vbm + 1] *
-            (1 - f0(self.energies[:self.idx_vbm + 1], fermi_level, temperature))
-            * self.de[:self.idx_vbm + 1], axis=0)
-        return (vb_integral - cb_integral) / (self.volume * self.A_to_cm ** 3)
+            self.tdos[:self.idx_fermi] *
+            (1 - f0(self.energies[:self.idx_fermi], fermi_level, temperature))
+            * self.de[:self.idx_fermi], axis=0)
+
+        # 1e-8 is conversion from Angstrom to cm
+        conv = self.volume * 1e-8 ** 3
+        doping = (vb_integral - cb_integral) / conv
+
+        if return_electron_hole_conc:
+            return doping, cb_integral / conv, vb_integral / conv
+        else:
+            return doping
 
     def get_fermi_interextrapolated(self, concentration: float,
                                     temperature: float, warn: bool = True,
@@ -568,7 +590,7 @@ class FermiDos(Dos, MSONable):
 
     def get_fermi(self, concentration: float, temperature: float,
                   rtol: float = 0.01, nstep: int = 50, step: float = 0.1,
-                  precision: int = 8):
+                  precision: int = 8, return_electron_hole_conc=False):
         """
         Finds the fermi level at which the doping concentration at the given
         temperature (T) is equal to concentration. A greedy algorithm is used
@@ -586,8 +608,13 @@ class FermiDos(Dos, MSONable):
             precision: Essentially the decimal places of calculated Fermi level.
 
         Returns:
-            The fermi level in eV.. Note that this is different from the default
-            dos.efermi.
+            If return_electron_hole_conc is False: The Fermi level in eV. Note
+            that this is different from the default dos.efermi.
+
+            If return_electron_hole_conc is True: the Fermi level, electron
+            concentration and hole concentration at the Fermi level as a tuple.
+            The electron and hole concentrations are in cm^-3.
+
         """
         fermi = self.efermi  # initialize target fermi
         relative_error = float("inf")
@@ -603,7 +630,13 @@ class FermiDos(Dos, MSONable):
             raise ValueError(
                 "Could not find fermi within {}% of concentration={}".format(
                     rtol * 100, concentration))
-        return fermi
+
+        if return_electron_hole_conc:
+            _, n_elec, n_hole = self.get_doping(
+                fermi, temperature, return_electron_hole_conc=True)
+            return fermi, n_elec, n_hole
+        else:
+            return fermi
 
     @classmethod
     def from_dict(cls, d):
@@ -613,7 +646,7 @@ class FermiDos(Dos, MSONable):
         dos = Dos(d["efermi"], d["energies"],
                   {Spin(int(k)): v for k, v in d["densities"].items()})
         return FermiDos(dos, structure=Structure.from_dict(d["structure"]),
-                        nelecs=d["nelecs"])
+                        nelecs=d["nelecs"], dos_weight=d["dos_weight"])
 
     def as_dict(self):
         """
@@ -624,7 +657,8 @@ class FermiDos(Dos, MSONable):
                 "energies": list(self.energies),
                 "densities": {str(spin): list(dens)
                               for spin, dens in self.densities.items()},
-                "structure": self.structure, "nelecs": self.nelecs}
+                "structure": self.structure, "nelecs": self.nelecs,
+                "dos_weight": self.dos_weight}
 
 
 class CompleteDos(Dos):
