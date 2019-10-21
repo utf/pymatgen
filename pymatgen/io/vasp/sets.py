@@ -767,6 +767,8 @@ class MPHSEBSSet(MPHSERelaxSet):
                  kpoints_line_density=20, **kwargs):
         super().__init__(structure, **kwargs)
         self.user_incar_settings = user_incar_settings or {}
+        user_kpoints_settings = self.user_kpoints_settings or {}
+
         self._config_dict["INCAR"].update({
             "NSW": 0,
             "ISMEAR": 0,
@@ -779,11 +781,11 @@ class MPHSEBSSet(MPHSERelaxSet):
         self.mode = mode
 
         if (not reciprocal_density or
-                "reciprocal_density" not in self.user_kpoints_settings):
+                "reciprocal_density" not in user_kpoints_settings):
             self.reciprocal_density = 50
         else:
-            self.reciprocal_density = reciprocal_density or \
-                                      self.user_kpoints_settings['reciprocal_density']
+            self.reciprocal_density = (reciprocal_density or
+                                       user_kpoints_settings['reciprocal_density'])
 
         self.kpoints_line_density = kpoints_line_density
         self.copy_chgcar = copy_chgcar
